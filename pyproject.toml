@@ -3,7 +3,7 @@ name = "ComfyUI"
 version = "0.4.0"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.11,<3.13" # select 3.12
+requires-python = ">=3.11,<3.12" # select 3.11
 dependencies = [
     "aiohttp>=3.11.8",
     "alembic>=1.16.5",
@@ -33,6 +33,24 @@ dependencies = [
     "tqdm>=4.67.1",
     "transformers>=4.50.3",
     "yarl>=1.18.0",
+    "trimesh>=4.10.1",
+    "pymeshlab>=2025.7",
+    "pygltflib>=1.16.5",
+    "xatlas>=0.0.11",
+    "open3d>=0.19.0",
+    "omegaconf>=2.3.0",
+    "configargparse>=1.7.1",
+    "diffusers>=0.36.0",
+    "accelerate>=1.12.0",
+    "pytorch-lightning>=2.6.0",
+    "opencv-python>=4.11.0.86",
+    "huggingface-hub>=0.36.0",
+    "scikit-image>=0.25.2",
+    "pybind11>=3.0.1",
+    "timm>=1.0.22",
+    "meshlib>=3.0.9.196",
+    "rembg>=2.0.69",
+    "onnxruntime>=1.23.2",
 ]
 
 [[tool.uv.index]]
