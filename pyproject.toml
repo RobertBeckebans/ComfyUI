@@ -69,6 +69,7 @@ dependencies = [
     "torchdiffeq>=0.2.5",
     "transforms3d>=0.4.2",
     "bitsandbytes>=0.42.0",
+    "imageio[ffmpeg]>=2.37.2",
 ]
 
 [[tool.uv.index]]
