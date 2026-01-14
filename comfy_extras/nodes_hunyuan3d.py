@@ -484,7 +484,7 @@ class VoxelToMesh(IO.ComfyNode):
     decode = execute  # TODO: remove
 
 
-def save_glb(vertices, faces, filepath, metadata=None):
+def save_glb(vertices, faces, filepath, metadata=None, colors=None):
     """
     Save PyTorch tensor vertices and faces as a GLB file without external dependencies.
 
@@ -498,8 +498,27 @@ def save_glb(vertices, faces, filepath, metadata=None):
     vertices_np = vertices.cpu().numpy().astype(np.float32)
     faces_np = faces.cpu().numpy().astype(np.uint32)
 
+    colors_np = None
+    if colors is not None:
+        c = colors.detach().cpu()
+        if c.dtype != torch.uint8:
+            # float -> uint8 (robust)
+            c = c.to(torch.float32)
+            if float(c.max()) <= 1.0:
+                c = (c * 255.0).clamp(0, 255).to(torch.uint8)
+            else:
+                c = c.clamp(0, 255).to(torch.uint8)
+
+        c_np = c.numpy()
+        if c_np.ndim == 2 and c_np.shape[0] == vertices_np.shape[0] and c_np.shape[1] in (3, 4):
+            if c_np.shape[1] == 3:
+                alpha = np.full((c_np.shape[0], 1), 255, dtype=np.uint8)
+                c_np = np.concatenate([c_np, alpha], axis=1)
+            colors_np = c_np  # (N,4) uint8 RGBA
+
     vertices_buffer = vertices_np.tobytes()
     indices_buffer = faces_np.tobytes()
+    colors_buffer   = colors_np.tobytes() if colors_np is not None else b""
 
     def pad_to_4_bytes(buffer):
         padding_length = (4 - (len(buffer) % 4)) % 4
@@ -507,13 +526,75 @@ def save_glb(vertices, faces, filepath, metadata=None):
 
     vertices_buffer_padded = pad_to_4_bytes(vertices_buffer)
     indices_buffer_padded = pad_to_4_bytes(indices_buffer)
+    colors_buffer_padded = pad_to_4_bytes(colors_buffer) if colors_buffer else b""
 
-    buffer_data = vertices_buffer_padded + indices_buffer_padded
+    buffer_data = vertices_buffer_padded + indices_buffer_padded + colors_buffer_padded
 
     vertices_byte_length = len(vertices_buffer)
     vertices_byte_offset = 0
     indices_byte_length = len(indices_buffer)
     indices_byte_offset = len(vertices_buffer_padded)
+    colors_byte_length = len(colors_buffer)
+    colors_byte_offset = indices_byte_offset + len(indices_buffer_padded)
+
+    # Build bufferViews
+    buffer_views = [
+        {
+            "buffer": 0,
+            "byteOffset": vertices_byte_offset,
+            "byteLength": vertices_byte_length,
+            "target": 34962  # ARRAY_BUFFER
+        },
+        {
+            "buffer": 0,
+            "byteOffset": indices_byte_offset,
+            "byteLength": indices_byte_length,
+            "target": 34963  # ELEMENT_ARRAY_BUFFER
+        }
+    ]
+
+    # Build accessors
+    accessors = [
+        {
+            "bufferView": 0,
+            "byteOffset": 0,
+            "componentType": 5126,  # FLOAT
+            "count": len(vertices_np),
+            "type": "VEC3",
+            "max": vertices_np.max(axis=0).tolist(),
+            "min": vertices_np.min(axis=0).tolist()
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 0,
+            "componentType": 5125,  # UNSIGNED_INT
+            "count": faces_np.size,
+            "type": "SCALAR"
+        }
+    ]
+
+    # Build primitive attributes
+    primitive_attributes = {"POSITION": 0}
+
+    # Add color buffer view and accessor if colors are provided
+    if colors_np is not None:
+        buffer_views.append({
+            "buffer": 0,
+            "byteOffset": colors_byte_offset,
+            "byteLength": colors_byte_length,
+            "target": 34962  # ARRAY_BUFFER
+        })
+        
+        accessors.append({
+            "bufferView": 2,
+            "byteOffset": 0,
+            "componentType": 5121,  # UNSIGNED_BYTE
+            "count": len(colors_np),
+            "type": "VEC4",
+            "normalized": True  # Important: tells glTF to normalize [0,255] to [0,1]
+        })
+        
+        primitive_attributes["COLOR_0"] = 2
 
     gltf = {
         "asset": {"version": "2.0", "generator": "ComfyUI"},
@@ -522,45 +603,13 @@ def save_glb(vertices, faces, filepath, metadata=None):
                 "byteLength": len(buffer_data)
             }
         ],
-        "bufferViews": [
-            {
-                "buffer": 0,
-                "byteOffset": vertices_byte_offset,
-                "byteLength": vertices_byte_length,
-                "target": 34962  # ARRAY_BUFFER
-            },
-            {
-                "buffer": 0,
-                "byteOffset": indices_byte_offset,
-                "byteLength": indices_byte_length,
-                "target": 34963  # ELEMENT_ARRAY_BUFFER
-            }
-        ],
-        "accessors": [
-            {
-                "bufferView": 0,
-                "byteOffset": 0,
-                "componentType": 5126,  # FLOAT
-                "count": len(vertices_np),
-                "type": "VEC3",
-                "max": vertices_np.max(axis=0).tolist(),
-                "min": vertices_np.min(axis=0).tolist()
-            },
-            {
-                "bufferView": 1,
-                "byteOffset": 0,
-                "componentType": 5125,  # UNSIGNED_INT
-                "count": faces_np.size,
-                "type": "SCALAR"
-            }
-        ],
+        "bufferViews": buffer_views,
+        "accessors": accessors,
         "meshes": [
             {
                 "primitives": [
                     {
-                        "attributes": {
-                            "POSITION": 0
-                        },
+                        "attributes": primitive_attributes,
                         "indices": 1,
                         "mode": 4  # TRIANGLES
                     }
@@ -639,10 +688,13 @@ class SaveGLB(IO.ComfyNode):
             if cls.hidden.extra_pnginfo is not None:
                 for x in cls.hidden.extra_pnginfo:
                     metadata[x] = json.dumps(cls.hidden.extra_pnginfo[x])
-
+        
         for i in range(mesh.vertices.shape[0]):
             f = f"{filename}_{counter:05}_.glb"
-            save_glb(mesh.vertices[i], mesh.faces[i], os.path.join(full_output_folder, f), metadata)
+            c = None
+            if hasattr(mesh, "vertex_colors"):
+                c = mesh.vertex_colors[i]  # (V,4) uint8 or float
+            save_glb(mesh.vertices[i], mesh.faces[i], os.path.join(full_output_folder, f), metadata, c)
             results.append({
                 "filename": f,
                 "subfolder": subfolder,
