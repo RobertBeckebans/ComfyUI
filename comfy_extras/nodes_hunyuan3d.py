@@ -458,6 +458,8 @@ class VoxelToMesh(IO.ComfyNode):
                 IO.Voxel.Input("voxel"),
                 IO.Combo.Input("algorithm", options=["surface net", "basic"]),
                 IO.Float.Input("threshold", default=0.6, min=-1.0, max=1.0, step=0.01),
+                IO.Combo.Input("vertex_colors", options=["none", "height", "density", "normal", "image_projection"], default="none", tooltip="Generate vertex colors for the mesh"),
+                IO.Image.Input("reference_image", optional=True, tooltip="Reference image for color projection (required when vertex_colors='image_projection')"),
             ],
             outputs=[
                 IO.Mesh.Output(),
@@ -465,9 +467,10 @@ class VoxelToMesh(IO.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, voxel, algorithm, threshold) -> IO.NodeOutput:
+    def execute(cls, voxel, algorithm, threshold, vertex_colors, reference_image=None) -> IO.NodeOutput:
         vertices = []
         faces = []
+        colors = []
 
         if algorithm == "basic":
             mesh_function = voxel_to_mesh
@@ -479,9 +482,229 @@ class VoxelToMesh(IO.ComfyNode):
             vertices.append(v)
             faces.append(f)
 
-        return IO.NodeOutput(Types.MESH(torch.stack(vertices), torch.stack(faces)))
+            # Generate vertex colors if requested
+            if vertex_colors != "none":
+                if vertex_colors == "image_projection" and reference_image is not None:
+                    # Use image projection for colors
+                    c = project_image_colors_to_vertices(v, reference_image[0] if len(reference_image.shape) == 4 else reference_image)
+                else:
+                    # Use procedural colors
+                    c = generate_vertex_colors_from_voxels(v, x, threshold=threshold, color_mode=vertex_colors)
+                colors.append(c)
+
+        mesh = Types.MESH(torch.stack(vertices), torch.stack(faces))
+
+        # Attach vertex colors to mesh if generated
+        if vertex_colors != "none" and len(colors) > 0:
+            mesh.vertex_colors = torch.stack(colors)
+
+        return IO.NodeOutput(mesh)
 
     decode = execute  # TODO: remove
+
+
+def project_image_colors_to_vertices(vertices, image, camera_distance=2.0, fov=40.0, num_views=4):
+    """
+    Project colors from a reference image onto mesh vertices using simple orthographic/perspective projection.
+
+    Parameters:
+    vertices: torch.Tensor of shape (N, 3) - Vertex coordinates (normalized -1 to 1)
+    image: torch.Tensor of shape (H, W, 3) - Reference image in [0, 1] range (RGB)
+    camera_distance: float - Distance of camera from origin
+    fov: float - Field of view in degrees (for perspective projection)
+    num_views: int - Number of views to project from (1=front only, 4=front+sides)
+
+    Returns:
+    torch.Tensor of shape (N, 4) - RGBA colors as uint8 [0-255]
+    """
+    device = vertices.device
+    num_vertices = vertices.shape[0]
+
+    if num_vertices == 0:
+        return torch.zeros((0, 4), dtype=torch.uint8, device=device)
+
+    # Convert image to device and ensure correct format
+    if image.device != device:
+        image = image.to(device)
+
+    # Image is expected to be (H, W, 3) in range [0, 1]
+    img_h, img_w = image.shape[0], image.shape[1]
+
+    # Initialize color accumulator
+    vertex_colors_sum = torch.zeros((num_vertices, 3), dtype=torch.float32, device=device)
+    vertex_weights = torch.zeros((num_vertices, 1), dtype=torch.float32, device=device)
+
+    # Define camera angles for multi-view projection
+    if num_views == 1:
+        camera_angles = [(0, 0)]  # Front view only
+    elif num_views == 4:
+        camera_angles = [(0, 0), (90, 0), (180, 0), (270, 0)]  # Front + 3 sides
+    else:
+        # Evenly distributed around
+        camera_angles = [(i * 360 / num_views, 0) for i in range(num_views)]
+
+    for azimuth, elevation in camera_angles:
+        # Rotate vertices based on camera angle
+        azimuth_rad = torch.tensor(azimuth * np.pi / 180.0, device=device)
+        elevation_rad = torch.tensor(elevation * np.pi / 180.0, device=device)
+
+        # Rotation matrix (simplified - rotate around Y axis for azimuth)
+        cos_a = torch.cos(azimuth_rad)
+        sin_a = torch.sin(azimuth_rad)
+
+        # Apply rotation
+        v_rotated = vertices.clone()
+        x_rot = vertices[:, 0] * cos_a - vertices[:, 2] * sin_a
+        z_rot = vertices[:, 0] * sin_a + vertices[:, 2] * cos_a
+        v_rotated[:, 0] = x_rot
+        v_rotated[:, 2] = z_rot
+
+        # Orthographic projection (simple: just take x, y coordinates)
+        # Vertices are in range [-1, 1], map to image coordinates [0, W-1] and [0, H-1]
+        x_proj = ((v_rotated[:, 0] + 1.0) * 0.5 * (img_w - 1)).clamp(0, img_w - 1)
+        y_proj = ((1.0 - (v_rotated[:, 1] + 1.0) * 0.5) * (img_h - 1)).clamp(0, img_h - 1)  # Flip Y
+
+        # Check which vertices are visible (positive z after rotation = facing camera)
+        visible = v_rotated[:, 2] > -0.5  # Allow some tolerance
+
+        # Sample colors from image using bilinear interpolation
+        x_floor = x_proj.floor().long()
+        y_floor = y_proj.floor().long()
+        x_ceil = (x_floor + 1).clamp(max=img_w - 1)
+        y_ceil = (y_floor + 1).clamp(max=img_h - 1)
+
+        # Bilinear interpolation weights
+        x_frac = (x_proj - x_floor.float()).unsqueeze(1)
+        y_frac = (y_proj - y_floor.float()).unsqueeze(1)
+
+        # Sample four corners
+        c00 = image[y_floor, x_floor]  # (N, 3)
+        c01 = image[y_floor, x_ceil]
+        c10 = image[y_ceil, x_floor]
+        c11 = image[y_ceil, x_ceil]
+
+        # Bilinear interpolation
+        c0 = c00 * (1 - x_frac) + c01 * x_frac
+        c1 = c10 * (1 - x_frac) + c11 * x_frac
+        sampled_colors = c0 * (1 - y_frac) + c1 * y_frac
+
+        # Accumulate colors for visible vertices
+        visible_mask = visible.unsqueeze(1).float()
+        vertex_colors_sum += sampled_colors * visible_mask
+        vertex_weights += visible_mask
+
+    # Average colors across views
+    vertex_weights = vertex_weights.clamp(min=1e-6)  # Avoid division by zero
+    final_colors = vertex_colors_sum / vertex_weights
+
+    # For vertices that weren't visible from any view, use a default color (gray)
+    no_color_mask = (vertex_weights.squeeze() < 0.1)
+    if no_color_mask.any():
+        # Fallback: use position-based coloring for invisible vertices
+        final_colors[no_color_mask] = ((vertices[no_color_mask] + 1.0) * 0.5).clamp(0, 1)
+
+    # Convert to uint8 RGBA
+    r = (final_colors[:, 0] * 255).clamp(0, 255).to(torch.uint8)
+    g = (final_colors[:, 1] * 255).clamp(0, 255).to(torch.uint8)
+    b = (final_colors[:, 2] * 255).clamp(0, 255).to(torch.uint8)
+    a = torch.full((num_vertices,), 255, dtype=torch.uint8, device=device)
+
+    colors = torch.stack([r, g, b, a], dim=1)
+    return colors
+
+
+def generate_vertex_colors_from_voxels(vertices, voxels, threshold=0.5, color_mode="height"):
+    """
+    Generate vertex colors for mesh vertices based on voxel data.
+
+    Parameters:
+    vertices: torch.Tensor of shape (N, 3) - The vertex coordinates (normalized -1 to 1)
+    voxels: torch.Tensor of shape (D, H, W) - The voxel density data
+    threshold: float - The threshold used for mesh extraction
+    color_mode: str - "height" (height-based gradient), "density" (voxel density values), or "normal" (normal-based)
+
+    Returns:
+    torch.Tensor of shape (N, 4) - RGBA colors as uint8 [0-255]
+    """
+    device = vertices.device
+    num_vertices = vertices.shape[0]
+
+    if num_vertices == 0:
+        return torch.zeros((0, 4), dtype=torch.uint8, device=device)
+
+    if color_mode == "height":
+        # Height-based gradient coloring (blue to red)
+        z_coords = vertices[:, 2]  # Assuming Z is up
+        z_min = z_coords.min()
+        z_max = z_coords.max()
+
+        if z_max > z_min:
+            normalized_height = (z_coords - z_min) / (z_max - z_min)
+        else:
+            normalized_height = torch.ones_like(z_coords) * 0.5
+
+        # Create a gradient from blue (low) to red (high)
+        r = (normalized_height * 255).clamp(0, 255).to(torch.uint8)
+        g = ((1.0 - torch.abs(normalized_height - 0.5) * 2.0) * 255).clamp(0, 255).to(torch.uint8)
+        b = ((1.0 - normalized_height) * 255).clamp(0, 255).to(torch.uint8)
+        a = torch.full((num_vertices,), 255, dtype=torch.uint8, device=device)
+
+        colors = torch.stack([r, g, b, a], dim=1)
+
+    elif color_mode == "density":
+        # Sample voxel density values at vertex positions
+        D, H, W = voxels.shape
+
+        # Convert normalized vertices (-1 to 1) back to voxel coordinates
+        v_max = max(D, H, W)
+        voxel_coords = vertices * (v_max / 2) + (v_max / 2)
+        voxel_coords = torch.fliplr(voxel_coords)  # Undo the flip from mesh generation
+
+        # Clamp to valid voxel range
+        voxel_coords[:, 0] = voxel_coords[:, 0].clamp(0, D - 1)
+        voxel_coords[:, 1] = voxel_coords[:, 1].clamp(0, H - 1)
+        voxel_coords[:, 2] = voxel_coords[:, 2].clamp(0, W - 1)
+
+        # Sample voxel values (using nearest neighbor for simplicity)
+        indices = voxel_coords.long()
+        sampled_densities = voxels[indices[:, 0], indices[:, 1], indices[:, 2]]
+
+        # Normalize densities to 0-1 range
+        density_min = sampled_densities.min()
+        density_max = sampled_densities.max()
+
+        if density_max > density_min:
+            normalized_density = (sampled_densities - density_min) / (density_max - density_min)
+        else:
+            normalized_density = torch.ones_like(sampled_densities) * 0.5
+
+        # Color based on density (grayscale to colored gradient)
+        r = (normalized_density * 255).clamp(0, 255).to(torch.uint8)
+        g = (normalized_density * 200).clamp(0, 255).to(torch.uint8)
+        b = (normalized_density * 150).clamp(0, 255).to(torch.uint8)
+        a = torch.full((num_vertices,), 255, dtype=torch.uint8, device=device)
+
+        colors = torch.stack([r, g, b, a], dim=1)
+
+    elif color_mode == "normal":
+        # Simple pseudo-normal based coloring
+        # This is a simplified version - proper normals would require face information
+        x_norm = (vertices[:, 0] + 1.0) * 0.5
+        y_norm = (vertices[:, 1] + 1.0) * 0.5
+        z_norm = (vertices[:, 2] + 1.0) * 0.5
+
+        r = (x_norm * 255).clamp(0, 255).to(torch.uint8)
+        g = (y_norm * 255).clamp(0, 255).to(torch.uint8)
+        b = (z_norm * 255).clamp(0, 255).to(torch.uint8)
+        a = torch.full((num_vertices,), 255, dtype=torch.uint8, device=device)
+
+        colors = torch.stack([r, g, b, a], dim=1)
+
+    else:
+        # Default: white color
+        colors = torch.full((num_vertices, 4), 255, dtype=torch.uint8, device=device)
+
+    return colors
 
 
 def save_glb(vertices, faces, filepath, metadata=None, colors=None):
@@ -584,7 +807,7 @@ def save_glb(vertices, faces, filepath, metadata=None, colors=None):
             "byteLength": colors_byte_length,
             "target": 34962  # ARRAY_BUFFER
         })
-        
+
         accessors.append({
             "bufferView": 2,
             "byteOffset": 0,
@@ -593,7 +816,7 @@ def save_glb(vertices, faces, filepath, metadata=None, colors=None):
             "type": "VEC4",
             "normalized": True  # Important: tells glTF to normalize [0,255] to [0,1]
         })
-        
+
         primitive_attributes["COLOR_0"] = 2
 
     gltf = {
@@ -688,7 +911,7 @@ class SaveGLB(IO.ComfyNode):
             if cls.hidden.extra_pnginfo is not None:
                 for x in cls.hidden.extra_pnginfo:
                     metadata[x] = json.dumps(cls.hidden.extra_pnginfo[x])
-        
+
         for i in range(mesh.vertices.shape[0]):
             f = f"{filename}_{counter:05}_.glb"
             c = None
@@ -704,6 +927,162 @@ class SaveGLB(IO.ComfyNode):
         return IO.NodeOutput(ui={"3d": results})
 
 
+class ProjectImageColorsToMesh(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="ProjectImageColorsToMesh",
+            category="3d",
+            inputs=[
+                IO.Mesh.Input("mesh"),
+                IO.Image.Input("image", tooltip="Reference image to project colors from"),
+                IO.Int.Input("num_views", default=4, min=1, max=8, tooltip="Number of camera angles to project from (1=front, 4=front+sides, 8=all around)"),
+                IO.Float.Input("camera_distance", default=2.0, min=0.1, max=10.0, step=0.1, tooltip="Distance of camera from object"),
+                IO.Combo.Input("fallback_mode", options=["gray", "position", "height"], default="position", tooltip="Color mode for vertices not visible from any camera angle"),
+            ],
+            outputs=[
+                IO.Mesh.Output(),
+            ]
+        )
+
+    @classmethod
+    def execute(cls, mesh, image, num_views, camera_distance, fallback_mode) -> IO.NodeOutput:
+        # Process each mesh in the batch
+        all_vertex_colors = []
+
+        for batch_idx in range(mesh.vertices.shape[0]):
+            vertices = mesh.vertices[batch_idx]  # (V, 3)
+
+            # Use first image in batch if image is batched
+            img = image[0] if len(image.shape) == 4 else image
+
+            # Project colors with enhanced fallback
+            colors = project_image_colors_to_vertices_enhanced(
+                vertices,
+                img,
+                camera_distance=camera_distance,
+                num_views=num_views,
+                fallback_mode=fallback_mode
+            )
+
+            all_vertex_colors.append(colors)
+
+        # Create output mesh with colors
+        output_mesh = Types.MESH(mesh.vertices, mesh.faces)
+        output_mesh.vertex_colors = torch.stack(all_vertex_colors)
+
+        return IO.NodeOutput(output_mesh)
+
+
+def project_image_colors_to_vertices_enhanced(vertices, image, camera_distance=2.0, num_views=4, fallback_mode="position"):
+    """
+    Enhanced version with better fallback handling for non-visible vertices.
+    """
+    device = vertices.device
+    num_vertices = vertices.shape[0]
+
+    if num_vertices == 0:
+        return torch.zeros((0, 4), dtype=torch.uint8, device=device)
+
+    # Convert image to device and ensure correct format
+    if image.device != device:
+        image = image.to(device)
+
+    img_h, img_w = image.shape[0], image.shape[1]
+
+    # Initialize color accumulator
+    vertex_colors_sum = torch.zeros((num_vertices, 3), dtype=torch.float32, device=device)
+    vertex_weights = torch.zeros((num_vertices, 1), dtype=torch.float32, device=device)
+
+    # Define camera angles for multi-view projection
+    if num_views == 1:
+        camera_angles = [(0, 0)]
+    elif num_views == 4:
+        camera_angles = [(0, 0), (90, 0), (180, 0), (270, 0)]
+    elif num_views == 6:
+        camera_angles = [(0, 0), (90, 0), (180, 0), (270, 0), (0, 90), (0, -90)]
+    else:
+        # Evenly distributed around
+        camera_angles = [(i * 360 / num_views, 0) for i in range(num_views)]
+
+    for azimuth, elevation in camera_angles:
+        # Rotate vertices based on camera angle
+        azimuth_rad = torch.tensor(azimuth * np.pi / 180.0, device=device)
+        elevation_rad = torch.tensor(elevation * np.pi / 180.0, device=device)
+
+        # Rotation matrix (around Y axis for azimuth)
+        cos_a = torch.cos(azimuth_rad)
+        sin_a = torch.sin(azimuth_rad)
+
+        # Apply rotation
+        v_rotated = vertices.clone()
+        x_rot = vertices[:, 0] * cos_a - vertices[:, 2] * sin_a
+        z_rot = vertices[:, 0] * sin_a + vertices[:, 2] * cos_a
+        v_rotated[:, 0] = x_rot
+        v_rotated[:, 2] = z_rot
+
+        # Orthographic projection
+        x_proj = ((v_rotated[:, 0] + 1.0) * 0.5 * (img_w - 1)).clamp(0, img_w - 1)
+        y_proj = ((1.0 - (v_rotated[:, 1] + 1.0) * 0.5) * (img_h - 1)).clamp(0, img_h - 1)
+
+        # Check visibility
+        visible = v_rotated[:, 2] > -0.5
+
+        # Bilinear interpolation
+        x_floor = x_proj.floor().long()
+        y_floor = y_proj.floor().long()
+        x_ceil = (x_floor + 1).clamp(max=img_w - 1)
+        y_ceil = (y_floor + 1).clamp(max=img_h - 1)
+
+        x_frac = (x_proj - x_floor.float()).unsqueeze(1)
+        y_frac = (y_proj - y_floor.float()).unsqueeze(1)
+
+        c00 = image[y_floor, x_floor]
+        c01 = image[y_floor, x_ceil]
+        c10 = image[y_ceil, x_floor]
+        c11 = image[y_ceil, x_ceil]
+
+        c0 = c00 * (1 - x_frac) + c01 * x_frac
+        c1 = c10 * (1 - x_frac) + c11 * x_frac
+        sampled_colors = c0 * (1 - y_frac) + c1 * y_frac
+
+        # Accumulate colors for visible vertices
+        visible_mask = visible.unsqueeze(1).float()
+        vertex_colors_sum += sampled_colors * visible_mask
+        vertex_weights += visible_mask
+
+    # Average colors across views
+    vertex_weights = vertex_weights.clamp(min=1e-6)
+    final_colors = vertex_colors_sum / vertex_weights
+
+    # Handle vertices not visible from any view
+    no_color_mask = (vertex_weights.squeeze() < 0.1)
+    if no_color_mask.any():
+        if fallback_mode == "gray":
+            final_colors[no_color_mask] = 0.5
+        elif fallback_mode == "height":
+            z_coords = vertices[no_color_mask, 2]
+            z_min, z_max = z_coords.min(), z_coords.max()
+            if z_max > z_min:
+                normalized_height = (z_coords - z_min) / (z_max - z_min)
+            else:
+                normalized_height = torch.ones_like(z_coords) * 0.5
+            final_colors[no_color_mask, 0] = normalized_height
+            final_colors[no_color_mask, 1] = 1.0 - torch.abs(normalized_height - 0.5) * 2.0
+            final_colors[no_color_mask, 2] = 1.0 - normalized_height
+        else:  # position
+            final_colors[no_color_mask] = ((vertices[no_color_mask] + 1.0) * 0.5).clamp(0, 1)
+
+    # Convert to uint8 RGBA
+    r = (final_colors[:, 0] * 255).clamp(0, 255).to(torch.uint8)
+    g = (final_colors[:, 1] * 255).clamp(0, 255).to(torch.uint8)
+    b = (final_colors[:, 2] * 255).clamp(0, 255).to(torch.uint8)
+    a = torch.full((num_vertices,), 255, dtype=torch.uint8, device=device)
+
+    colors = torch.stack([r, g, b, a], dim=1)
+    return colors
+
+
 class Hunyuan3dExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
@@ -715,6 +1094,7 @@ class Hunyuan3dExtension(ComfyExtension):
             VoxelToMeshBasic,
             VoxelToMesh,
             SaveGLB,
+            ProjectImageColorsToMesh,
         ]
 
 
