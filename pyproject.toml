@@ -3,7 +3,7 @@ name = "ComfyUI"
 version = "0.9.1"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.11,<3.12" # select 3.11
+requires-python = ">=3.12,<3.13" # select 3.12
 dependencies = [
     "aiohttp>=3.11.8",
     "alembic>=1.16.5",
@@ -25,11 +25,7 @@ dependencies = [
     "spandrel>=0.4.1",
     "sqlalchemy>=2.0.45",
     "tokenizers>=0.13.3",
-    "pytorch-triton-rocm>=3.1.0",
-    "torch>=2.8.0",
-    "torchaudio>=2.8.0",
     "torchsde>=0.2.6",
-    "torchvision>=0.23.0",
     "tqdm>=4.67.1",
     "transformers>=4.50.3",
     "yarl>=1.18.0",
@@ -72,9 +68,52 @@ dependencies = [
     "imageio[ffmpeg]>=2.37.2",
 ]
 
+[project.optional-dependencies]
+cpu = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+]
+cuda = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+]
+rocm = [
+    "torch ; sys_platform == 'linux'",
+    "torchvision ; sys_platform == 'linux'",
+    "torchaudio ; sys_platform == 'linux'",
+    "triton-rocm ; sys_platform == 'linux'",
+    "torch @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torch-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ; sys_platform == 'win32'",
+    "torchvision @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchvision-0.24.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ; sys_platform == 'win32'",
+    "rocm_sdk_core @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl ; sys_platform == 'win32'",
+    "rocm_sdk_libraries_custom @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_libraries_custom-7.2.0.dev0-py3-none-win_amd64.whl ; sys_platform == 'win32'",
+    "rocm @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm-7.2.0.dev0.tar.gz ; sys_platform == 'win32'",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cuda" },
+    { extra = "rocm" },
+  ],
+]
+#environments = ["sys_platform == 'win32'", "sys_platform == 'linux'"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [[tool.uv.index]]
 name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm6.4"
+url = "https://download.pytorch.org/whl/rocm7.1"
 explicit = true
 
 [[tool.uv.index]]
@@ -83,10 +122,24 @@ url = "https://gitlab.inria.fr/api/v4/projects/18692/packages/pypi/simple"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-rocm" }]
-torchvision = [{ index = "pytorch-rocm" }]
-torchaudio = [{ index = "pytorch-rocm" }]
-pytorch-triton-rocm = [{ index = "pytorch-rocm" }]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+triton-rocm = [
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
 fbxsdkpy = [{ index = "inria" }]
 
 
