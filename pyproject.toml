@@ -3,7 +3,109 @@ name = "ComfyUI"
 version = "0.34.0"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13" # select 3.12
+dependencies = [
+    "aiohttp>=3.11.8",
+    "alembic",
+    "av>=17.0.0",
+    "blake3",
+    "comfy-aimdo==0.4.15",
+    "comfy-angle",
+    "comfy-kitchen==0.2.31",
+    "comfyui-embedded-docs==0.5.10",
+    "comfyui-frontend-package==1.51.9",
+    "comfyui-workflow-templates==0.11.50",
+    "einops",
+    "filelock",
+    "kornia>=0.7.1",
+    "numpy>=1.25.0",
+    "Pillow",
+    "psutil",
+    "pydantic~=2.0",
+    "pydantic-settings~=2.0",
+    "PyOpenGL>=3.1.8",
+    "pyyaml",
+    "requests",
+    "safetensors>=0.4.2",
+    "scipy",
+    "sentencepiece",
+    "simpleeval>=1.0.0",
+    "spandrel",
+    "SQLAlchemy>=2.0.0",
+    "tokenizers>=0.13.3",
+    "torchsde",
+    "tqdm",
+    "transformers>=4.50.3",
+    "yarl>=1.18.0",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+]
+cuda = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+]
+rocm = [
+    "torch ; sys_platform == 'linux'",
+    "torchvision ; sys_platform == 'linux'",
+    "torchaudio ; sys_platform == 'linux'",
+    "triton-rocm ; sys_platform == 'linux'",
+    "torch @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torch-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ; sys_platform == 'win32'",
+    "torchvision @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchvision-0.24.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ; sys_platform == 'win32'",
+    "torchaudio @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchaudio-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl ; sys_platform == 'win32'",
+    "rocm_sdk_core @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl ; sys_platform == 'win32'",
+    "rocm_sdk_libraries_custom @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_libraries_custom-7.2.0.dev0-py3-none-win_amd64.whl ; sys_platform == 'win32'",
+    "rocm @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm-7.2.0.dev0.tar.gz ; sys_platform == 'win32'",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cuda" },
+    { extra = "rocm" },
+  ],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm7.1"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
+triton-rocm = [
+    { index = "pytorch-rocm", extra = "rocm", marker = "sys_platform == 'linux'" },
+]
 
 [project.urls]
 homepage = "https://www.comfy.org/"
